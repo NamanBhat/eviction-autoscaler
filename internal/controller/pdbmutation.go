@@ -77,6 +77,24 @@ func snapshotPDBSpec(pdb *policyv1.PodDisruptionBudget) error {
 	return nil
 }
 
+// pdbSpecMatchesSnapshot reports whether the PDB's current disruption fields are byte-
+// identical to the stored restore snapshot — i.e. we have already captured this exact
+// partner intent. Used to avoid re-pinning (and thrashing) when a controller re-asserts a
+// spec we already honored. (false, nil) when the PDB carries no snapshot.
+func pdbSpecMatchesSnapshot(pdb *policyv1.PodDisruptionBudget) (bool, error) {
+	if !isMutated(pdb) {
+		return false, nil
+	}
+	cur, err := json.Marshal(pdbFloorSnapshot{
+		MinAvailable:   pdb.Spec.MinAvailable,
+		MaxUnavailable: pdb.Spec.MaxUnavailable,
+	})
+	if err != nil {
+		return false, fmt.Errorf("pdbSpecMatchesSnapshot: marshal current spec: %w", err)
+	}
+	return string(cur) == pdb.Annotations[AnnotationOriginalPDBSpec], nil
+}
+
 // pinPDBFloor rewrites the PDB to minAvailable: floor (clearing maxUnavailable) and
 // records the floor on the PDB so it survives a lost CR status write.
 func pinPDBFloor(pdb *policyv1.PodDisruptionBudget, floor int32) {

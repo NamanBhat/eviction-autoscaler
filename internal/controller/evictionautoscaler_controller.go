@@ -414,10 +414,10 @@ func (r *EvictionAutoScalerReconciler) pinFloorBeforeSurge(ctx context.Context, 
 	return r.ensurePDBFloor(ctx, eas, pdb, liveReplicas)
 }
 
-// ensurePDBFloor pins an absolute PDB floor derived from the partner's spec at the frozen
-// baseline (Status.MinReplicas). Pins once (no-op if already pinned, never re-pins over a
-// partner overwrite); first-capture is skipped unless liveReplicas == MinReplicas, so an
-// autoscaler above its min is never pinned.
+// ensurePDBFloor pins an absolute PDB floor derived at the frozen baseline
+// (Status.MinReplicas); first-capture only at baseline (an autoscaler above its min is
+// never pinned). A mid-drain partner edit is honored — re-snapshotted and re-pinned —
+// unless it already matches our snapshot, in which case we yield (no re-pin thrash).
 func (r *EvictionAutoScalerReconciler) ensurePDBFloor(ctx context.Context, eas *myappsv1.EvictionAutoScaler, pdb *policyv1.PodDisruptionBudget, liveReplicas int32) (int32, bool, error) {
 	var floor int32
 	firstCapture := false
@@ -449,9 +449,7 @@ func (r *EvictionAutoScalerReconciler) ensurePDBFloor(ctx context.Context, eas *
 		return 0, false, nil
 	}
 
-	// Pin only on first capture. If a pin was already recorded but the PDB no longer
-	// carries it, a partner overwrote it mid-drain — leave their spec untouched (no
-	// defend; the guarded restore preserves their edit at completion).
+	// First capture: pin the freshly derived floor.
 	if firstCapture && !pdbCarriesFloor(pdb, floor) {
 		if err := snapshotPDBSpec(pdb); err != nil {
 			return 0, false, err
@@ -460,6 +458,35 @@ func (r *EvictionAutoScalerReconciler) ensurePDBFloor(ctx context.Context, eas *
 		if err := r.Update(ctx, pdb); err != nil {
 			return 0, false, err
 		}
+		return floor, true, nil
+	}
+
+	// Mid-drain partner edit (pin overwritten; replica changes already bailed at the call
+	// site). Honor a genuinely new spec by re-snapshotting + re-pinning at the frozen
+	// baseline; yield if it matches our snapshot so a re-asserting controller can't thrash.
+	if isMutated(pdb) && !pdbCarriesFloor(pdb, floor) {
+		same, err := pdbSpecMatchesSnapshot(pdb)
+		if err != nil {
+			return 0, false, err
+		}
+		if same {
+			return 0, false, nil
+		}
+		newFloor, err := desiredHealthyAt(pdb.Spec, eas.Status.MinReplicas)
+		if err != nil {
+			return 0, false, err
+		}
+		if newFloor <= 0 {
+			return 0, false, nil
+		}
+		if err := snapshotPDBSpec(pdb); err != nil {
+			return 0, false, err
+		}
+		pinPDBFloor(pdb, newFloor)
+		if err := r.Update(ctx, pdb); err != nil {
+			return 0, false, err
+		}
+		return newFloor, true, nil
 	}
 
 	return floor, true, nil
